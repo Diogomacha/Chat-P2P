@@ -3,138 +3,182 @@ package br.ufsm.poli.csi.redes.service;
 import br.ufsm.poli.csi.redes.model.Mensagem;
 import br.ufsm.poli.csi.redes.model.Usuario;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
 import java.io.IOException;
 import java.net.*;
-import java.util.HashSet;
-import java.util.Set;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class UDPServiceImpl implements UDPService {
 
-    private static final int PORTA = 6789;
-    private static final String GRUPO = "230.0.0.1";
+    private final Map<InetAddress, Long> ultimasSondas = new ConcurrentHashMap<>();
+    private final Map<InetAddress, Usuario> usuariosOnline = new ConcurrentHashMap<>();
 
-    private MulticastSocket socket;
-    private InetAddress grupo;
-    private ObjectMapper objectMapper = new ObjectMapper();
+    private Usuario usuario = null;
 
-    private Set<Usuario> usuarios = new HashSet<>();
-    private Set<UDPServiceMensagemListener> listenersMensagem = new HashSet<>();
-    private Set<UDPServiceUsuarioListener> listenersUsuario = new HashSet<>();
+    private UDPServiceMensagemListener mensagemListener = null;
+    private UDPServiceUsuarioListener usuarioListener = null;
 
     public UDPServiceImpl() {
-        try {
-            grupo = InetAddress.getByName(GRUPO);
-            socket = new MulticastSocket(PORTA);
-            socket.joinGroup(grupo);
-
-            // Thread que fica escutando mensagens recebidas
-            new Thread(this::escutarMensagens).start();
-
-            // Envia sonda inicial (para anunciar que entrou)
-            Mensagem msg = new Mensagem();
-            msg.setTipoMensagem(Mensagem.TipoMensagem.sonda);
-            msg.setUsuario(InetAddress.getLocalHost().getHostName());
-            enviarParaGrupo(msg);
-
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+        new Thread(new RecebeSonda()).start();
+        new Thread(new EnviaSonda()).start();
+        new Thread(new LimpaUsuariosInativos()).start();
     }
 
-    private void escutarMensagens() {
-        byte[] buffer = new byte[1024];
-        while (true) {
+
+    private class EnviaSonda implements Runnable {
+        @Override
+        public void run() {
             try {
-                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                socket.receive(packet);
+                while (true) {
+                    Thread.sleep(5000);
+                    if (usuario == null) continue;
 
-                String json = new String(packet.getData(), 0, packet.getLength());
-                Mensagem mensagem = objectMapper.readValue(json, Mensagem.class);
+                    Mensagem mensagem = new Mensagem();
+                    mensagem.setTipoMensagem(Mensagem.TipoMensagem.sonda);
+                    mensagem.setUsuario(usuario.getNome());
+                    mensagem.setStatus(usuario.getStatus().toString());
 
-                InetAddress remetenteAddr = packet.getAddress();
-                Usuario remetente = new Usuario(mensagem.getUsuario(), Usuario.StatusUsuario.DISPONIVEL, remetenteAddr);
+                    ObjectMapper mapper = new ObjectMapper();
+                    String strMensagem = mapper.writeValueAsString(mensagem);
+                    byte[] bMensagem = strMensagem.getBytes();
 
-                switch (mensagem.getTipoMensagem()) {
-                    case sonda:
-                        notificarUsuarioAdicionado(remetente);
-                        break;
-
-                    case msg_individual:
-                        notificarMensagem(mensagem.getMsg(), remetente, false);
-                        break;
-
-                    case msg_grupo:
-                        notificarMensagem(mensagem.getMsg(), remetente, true);
-                        break;
-
-                    case fim_chat:
-                        notificarFimChat(remetente);
-                        notificarUsuarioRemovido(remetente);
-                        break;
-
-                    case disponivel:
-                        notificarUsuarioAlterado(remetente);
-                        break;
+                    for (int i = 1; i < 255; i++) {
+                        DatagramPacket packet = new DatagramPacket(
+                                bMensagem,
+                                bMensagem.length,
+                                InetAddress.getByName("192.168.0." + i),
+                                8080
+                        );
+                        DatagramSocket socket = new DatagramSocket();
+                        socket.send(packet);
+                        socket.close();
+                    }
                 }
-
             } catch (Exception e) {
                 e.printStackTrace();
             }
         }
     }
 
-    private void enviarParaGrupo(Mensagem msg) throws IOException {
-        String json = objectMapper.writeValueAsString(msg);
-        byte[] buffer = json.getBytes();
-        DatagramPacket packet = new DatagramPacket(buffer, buffer.length, grupo, PORTA);
-        socket.send(packet);
-    }
 
-    private void notificarMensagem(String mensagem, Usuario remetente, boolean chatGeral) {
-        for (UDPServiceMensagemListener listener : listenersMensagem) {
-            listener.mensagemRecebida(mensagem, remetente, chatGeral);
-        }
-    }
-
-    private void notificarFimChat(Usuario remetente) {
-        for (UDPServiceMensagemListener listener : listenersMensagem) {
-            listener.fimChatPelaOutraParte(remetente);
-        }
-    }
-
-    private void notificarUsuarioAdicionado(Usuario usuario) {
-        if (usuarios.add(usuario)) {
-            for (UDPServiceUsuarioListener listener : listenersUsuario) {
-                listener.usuarioAdicionado(usuario);
+    private class RecebeSonda implements Runnable {
+        @Override
+        public void run() {
+            try (DatagramSocket socket = new DatagramSocket(8080)) {
+                while (true) {
+                    byte[] buf = new byte[1024];
+                    DatagramPacket packet = new DatagramPacket(buf, buf.length);
+                    socket.receive(packet);
+                    processarPacote(packet);
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
             }
         }
     }
 
-    private void notificarUsuarioRemovido(Usuario usuario) {
-        if (usuarios.remove(usuario)) {
-            for (UDPServiceUsuarioListener listener : listenersUsuario) {
-                listener.usuarioRemovido(usuario);
+
+    private class LimpaUsuariosInativos implements Runnable {
+        @Override
+        public void run() {
+            try {
+                while (true) {
+                    Thread.sleep(10000);
+                    for (Map.Entry<InetAddress, Long> entry : ultimasSondas.entrySet()) {
+                        InetAddress enderecoInativo = entry.getKey();
+                        long ultimoTimestamp = entry.getValue();
+                        if (System.currentTimeMillis() - ultimoTimestamp > 30000) {
+                            Usuario remover = usuariosOnline.get(enderecoInativo);
+                            if (remover != null && usuarioListener != null) {
+                                usuarioListener.usuarioRemovido(remover);
+                            }
+                            usuariosOnline.remove(enderecoInativo);
+                            ultimasSondas.remove(enderecoInativo);
+                        }
+                    }
+                }
+            } catch (InterruptedException e) {
+                e.printStackTrace();
             }
         }
     }
 
-    private void notificarUsuarioAlterado(Usuario usuario) {
-        for (UDPServiceUsuarioListener listener : listenersUsuario) {
-            listener.usuarioAlterado(usuario);
+    private void processarPacote(DatagramPacket packet) throws IOException {
+        String strMensagem = new String(packet.getData(), 0, packet.getLength());
+        ObjectMapper mapper = new ObjectMapper();
+        Mensagem mensagemRecebida = mapper.readValue(strMensagem, Mensagem.class);
+
+        if (usuario != null && packet.getAddress().equals(usuario.getEndereco())) return;
+
+        if (mensagemRecebida.getTipoMensagem() == Mensagem.TipoMensagem.sonda) {
+            Usuario usuarioSonda = new Usuario();
+            usuarioSonda.setNome(mensagemRecebida.getUsuario());
+            usuarioSonda.setStatus(getStatusOrDefault(mensagemRecebida.getStatus()));
+            usuarioSonda.setEndereco(packet.getAddress());
+
+            ultimasSondas.put(usuarioSonda.getEndereco(), System.currentTimeMillis());
+            usuariosOnline.put(usuarioSonda.getEndereco(), usuarioSonda);
+
+            if (usuarioListener != null) {
+                usuarioListener.usuarioAlterado(usuarioSonda);
+            }
+
+        } else if (mensagemRecebida.getTipoMensagem() == Mensagem.TipoMensagem.msg_individual ||
+                mensagemRecebida.getTipoMensagem() == Mensagem.TipoMensagem.msg_grupo) {
+            if (mensagemListener != null) {
+                Usuario remetente = new Usuario();
+                remetente.setNome(mensagemRecebida.getUsuario());
+                remetente.setStatus(getStatusOrDefault(mensagemRecebida.getStatus()));
+                remetente.setEndereco(packet.getAddress());
+                boolean isChatGeral = mensagemRecebida.getTipoMensagem() == Mensagem.TipoMensagem.msg_grupo;
+                mensagemListener.mensagemRecebida(mensagemRecebida.getMsg(), remetente, isChatGeral);
+            }
+        } else if (mensagemRecebida.getTipoMensagem() == Mensagem.TipoMensagem.fim_chat) {
+            if (mensagemListener != null) {
+                Usuario remetente = new Usuario();
+                remetente.setNome(mensagemRecebida.getUsuario());
+                remetente.setEndereco(packet.getAddress());
+                mensagemListener.fimChatPelaOutraParte(remetente);
+            }
         }
     }
 
-    // === Métodos da interface ===
+    private Usuario.StatusUsuario getStatusOrDefault(String statusString) {
+        if (statusString == null || statusString.isEmpty()) return Usuario.StatusUsuario.DISPONIVEL;
+        try {
+            return Usuario.StatusUsuario.valueOf(statusString.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            return Usuario.StatusUsuario.DISPONIVEL;
+        }
+    }
 
     @Override
     public void enviarMensagem(String mensagem, Usuario destinatario, boolean chatGeral) {
         try {
             Mensagem msg = new Mensagem();
+            msg.setUsuario(usuario.getNome());
             msg.setMsg(mensagem);
-            msg.setUsuario(InetAddress.getLocalHost().getHostName());
+            msg.setStatus(usuario.getStatus().toString());
             msg.setTipoMensagem(chatGeral ? Mensagem.TipoMensagem.msg_grupo : Mensagem.TipoMensagem.msg_individual);
-            enviarParaGrupo(msg);
+
+            ObjectMapper mapper = new ObjectMapper();
+            byte[] bMensagem = mapper.writeValueAsBytes(msg);
+
+            DatagramPacket packet;
+            if (chatGeral) {
+                for (int i = 1; i < 255; i++) {
+                    packet = new DatagramPacket(bMensagem, bMensagem.length, InetAddress.getByName("192.168.0." + i), 8080);
+                    DatagramSocket socket = new DatagramSocket();
+                    socket.send(packet);
+                    socket.close();
+                }
+            } else {
+                packet = new DatagramPacket(bMensagem, bMensagem.length, destinatario.getEndereco(), 8080);
+                DatagramSocket socket = new DatagramSocket();
+                socket.send(packet);
+                socket.close();
+            }
+
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -142,36 +186,35 @@ public class UDPServiceImpl implements UDPService {
 
     @Override
     public void usuarioAlterado(Usuario usuario) {
-        try {
-            Mensagem msg = new Mensagem();
-            msg.setTipoMensagem(Mensagem.TipoMensagem.disponivel);
-            msg.setUsuario(usuario.getNome());
-            msg.setStatus(usuario.getStatus().toString());
-            enviarParaGrupo(msg);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+        this.usuario = usuario;
     }
 
     @Override
     public void addListenerMensagem(UDPServiceMensagemListener listener) {
-        listenersMensagem.add(listener);
+        this.mensagemListener = listener;
     }
 
     @Override
     public void fimChat(Usuario usuario) {
         try {
             Mensagem msg = new Mensagem();
-            msg.setTipoMensagem(Mensagem.TipoMensagem.fim_chat);
             msg.setUsuario(usuario.getNome());
-            enviarParaGrupo(msg);
-        } catch (Exception e) {
+            msg.setTipoMensagem(Mensagem.TipoMensagem.fim_chat);
+
+            ObjectMapper mapper = new ObjectMapper();
+            byte[] bMensagem = mapper.writeValueAsBytes(msg);
+
+            DatagramPacket packet = new DatagramPacket(bMensagem, bMensagem.length, usuario.getEndereco(), 8080);
+            DatagramSocket socket = new DatagramSocket();
+            socket.send(packet);
+            socket.close();
+        } catch (IOException e) {
             e.printStackTrace();
         }
     }
 
     @Override
     public void addListenerUsuario(UDPServiceUsuarioListener listener) {
-        listenersUsuario.add(listener);
+        this.usuarioListener = listener;
     }
 }
